@@ -4,6 +4,7 @@ import pandas as pd
 import requests
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances, manhattan_distances
+from concurrent.futures import ThreadPoolExecutor
 
 # ══════════════════════════════════════════════════════════════════════
 #  PAGE CONFIG
@@ -233,7 +234,7 @@ def load_data():
 @st.cache_resource
 def get_dense_matrix():
     """
-    Converts the sparse TF-IDF matrix (~400 MB dense) once and caches it.
+    Converts the sparse TF-IDF matrix (~400 MB dense) once and cached it.
     Used only by rec_pearson — first call is slow, subsequent calls are instant.
     """
     _, vecs = load_data()
@@ -246,6 +247,10 @@ movies, tfidf_vectors = load_data()
 # ══════════════════════════════════════════════════════════════════
 #  SESSION STATE DEFAULTS
 # ══════════════════════════════════════════════════════════════════
+# State untuk menyimpan 10 film acak agar tidak re-render saat tombol diklik
+if 'random_movies' not in st.session_state:
+    st.session_state.random_movies = movies.sample(10)
+
 _DEFAULTS = {
     'selected_movie':  None,
     'show_recs':       False,
@@ -261,7 +266,6 @@ for _k, _v in _DEFAULTS.items():
 # ══════════════════════════════════════════════════════════════════
 _API_KEY = "eba485e014425aca04e53e56b2619ca0"
 
-
 @st.cache_data(ttl=86400)
 def fetch_poster(movie_id: int) -> str:
     try:
@@ -273,6 +277,14 @@ def fetch_poster(movie_id: int) -> str:
     except Exception:
         pass
     return "https://placehold.co/342x513/141414/c9a84c?text=No+Poster"
+
+
+def fetch_posters_parallel(movie_ids: list) -> dict:
+    """Fungsi pembantu untuk mengunduh banyak poster secara serentak (Multi-threading)."""
+    unique_ids = list(set(movie_ids))
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        urls = list(executor.map(fetch_poster, unique_ids))
+    return dict(zip(unique_ids, urls))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -289,17 +301,17 @@ def _build_top(scores: np.ndarray, descending: bool, skip_idx: int, n: int):
     ][:n]
 
 
-def rec_cosine(idx: int, n: int = 5):
+def rec_cosine(idx: int, n: int = 10):
     sim = cosine_similarity(tfidf_vectors[idx], tfidf_vectors)[0]
     return _build_top(sim, True, idx, n)
 
 
-def rec_euclidean(idx: int, n: int = 5):
+def rec_euclidean(idx: int, n: int = 10):
     dist = euclidean_distances(tfidf_vectors[idx], tfidf_vectors)[0]
     return _build_top(dist, False, idx, n)
 
 
-def rec_jaccard(idx: int, n: int = 5):
+def rec_jaccard(idx: int, n: int = 10):
     iv    = (tfidf_vectors[idx] > 0).astype(int)
     bv    = (tfidf_vectors > 0).astype(int)
     inter = bv.dot(iv.T).toarray().flatten()
@@ -308,12 +320,12 @@ def rec_jaccard(idx: int, n: int = 5):
     return _build_top(jac, True, idx, n)
 
 
-def rec_manhattan(idx: int, n: int = 5):
+def rec_manhattan(idx: int, n: int = 10):
     dist = manhattan_distances(tfidf_vectors[idx], tfidf_vectors)[0]
     return _build_top(dist, False, idx, n)
 
 
-def rec_pearson(idx: int, n: int = 5):
+def rec_pearson(idx: int, n: int = 10):
     dm       = get_dense_matrix()          # ~400 MB, loaded once
     inp      = dm[idx]
     inp_c    = inp - inp.mean()
@@ -389,20 +401,22 @@ METRICS: dict = {
 def render_movie_grid(pairs: list, n_cols: int = 5, max_n: int = 10):
     """
     Renders a poster grid from a list of (title, movie_id) pairs.
-    Each card: poster image · title label · Select button.
     """
     subset = pairs[:max_n]
+    
+    # Menarik seluruh poster secara paralel sebelum proses rendering visual
+    mids = [mid for _, mid in subset]
+    poster_dict = fetch_posters_parallel(mids)
+    
     for chunk in [subset[i:i + n_cols] for i in range(0, len(subset), n_cols)]:
         cols = st.columns(n_cols)
         for col, (title, mid) in zip(cols, chunk):
             with col:
-                st.image(fetch_poster(mid), use_container_width=True)
-                st.markdown(f'<div class="mv-label">{title}</div>',
-                            unsafe_allow_html=True)
+                st.image(poster_dict[mid], use_container_width=True)
+                st.markdown(f'<div class="mv-label">{title}</div>', unsafe_allow_html=True)
                 is_sel  = st.session_state.selected_movie == title
                 btn_lbl = "✓ Selected" if is_sel else "Select"
-                if st.button(btn_lbl, key=f"g_{mid}",
-                             use_container_width=True, disabled=is_sel):
+                if st.button(btn_lbl, key=f"g_{mid}", use_container_width=True, disabled=is_sel):
                     st.session_state.selected_movie  = title
                     st.session_state.show_recs       = False
                     st.session_state.comparison_done = False
@@ -411,18 +425,22 @@ def render_movie_grid(pairs: list, n_cols: int = 5, max_n: int = 10):
 
 
 def render_rec_row(recs: list, unit: str):
-    """Renders 5 recommendation cards in a single row with score chips."""
-    cols = st.columns(5)
-    for col, (title, mid, score) in zip(cols, recs):
-        with col:
-            st.image(fetch_poster(mid), use_container_width=True)
-            st.markdown(f'<div class="mv-label">{title}</div>',
-                        unsafe_allow_html=True)
-            st.markdown(
-                f'<div style="text-align:center">'
-                f'<span class="chip">{unit}: {score:.4f}</span></div>',
-                unsafe_allow_html=True,
-            )
+    """Renders 10 recommendation cards (2 rows of 5) with score chips."""
+    # Menarik 10 poster secara paralel
+    mids = [mid for _, mid, _ in recs]
+    poster_dict = fetch_posters_parallel(mids)
+    
+    for i in range(0, len(recs), 5):
+        cols = st.columns(5)
+        for col, (title, mid, score) in zip(cols, recs[i:i+5]):
+            with col:
+                st.image(poster_dict[mid], use_container_width=True)
+                st.markdown(f'<div class="mv-label">{title}</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="text-align:center">'
+                    f'<span class="chip">{unit}: {score:.4f}</span></div>',
+                    unsafe_allow_html=True,
+                )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -476,10 +494,17 @@ if query.strip():
             list(zip(hits['title'].values, hits['Movie_id'].values))
         )
 else:
-    st.caption("Featured films  ·  Type above to search by title")
-    top10 = movies.head(10)
+    r_col1, r_col2 = st.columns([8, 1])
+    with r_col1:
+        st.caption("🎲 Random films  ·  Type above to search by title")
+    with r_col2:
+        if st.button("↻ Shuffle", use_container_width=True):
+            st.session_state.random_movies = movies.sample(10)
+            st.rerun()
+            
+    rand_10 = st.session_state.random_movies
     render_movie_grid(
-        list(zip(top10['title'].values, top10['Movie_id'].values))
+        list(zip(rand_10['title'].values, rand_10['Movie_id'].values))
     )
 
 st.divider()
@@ -544,7 +569,7 @@ if st.session_state.show_recs and sel:
         )
 
     with st.spinner(f"Computing {chosen}…"):
-        primary_recs = m["fn"](sel_idx)
+        primary_recs = m["fn"](sel_idx, n=10) # Disesuaikan menjadi 10 film
 
     render_rec_row(primary_recs, m["unit"])
 
@@ -566,7 +591,7 @@ if st.session_state.show_recs and sel:
         comp: dict = {}
         for mname, mdata in METRICS.items():
             with st.spinner(f"Running {mname}…"):
-                comp[mname] = mdata["fn"](sel_idx)
+                comp[mname] = mdata["fn"](sel_idx, n=5) # Komparasi dibatasi 5 agar UI muat
         st.session_state.comparison_data = comp
         st.session_state.comparison_done = True
 
@@ -582,6 +607,10 @@ if st.session_state.show_recs and sel:
             f"Top-5 recommendations for **{sel}** — ranked independently by each metric."
         )
 
+        # Pre-fetch seluruh poster untuk tab komparasi secara serentak
+        all_comp_mids = [mid for results in comp.values() for _, mid, _ in results]
+        comp_poster_dict = fetch_posters_parallel(all_comp_mids)
+
         # ── Tabs: one per metric with poster grid ────────────────
         tabs = st.tabs(list(comp.keys()))
         for tab, (mname, results) in zip(tabs, comp.items()):
@@ -596,7 +625,7 @@ if st.session_state.show_recs and sel:
                 t_cols = st.columns(5)
                 for t_col, (title, mid, score) in zip(t_cols, results):
                     with t_col:
-                        st.image(fetch_poster(mid), use_container_width=True)
+                        st.image(comp_poster_dict[mid], use_container_width=True)
                         st.markdown(
                             f'<div class="mv-label">{title}</div>',
                             unsafe_allow_html=True,
